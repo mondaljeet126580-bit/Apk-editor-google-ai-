@@ -1,0 +1,68 @@
+<resources>
+    <string name="app_name">APK Editor GM</string>
+
+    <!-- Home Screen -->
+    <string name="menu_apk_file">APK file</string>
+    <string name="menu_installed_app">Installed app</string>
+    <string name="menu_projects">Projects</string>
+    <string name="menu_settings">Settings</string>
+    <string name="menu_webview">WebView</string>
+    <string name="menu_current_activity">Current Activity</string>
+    <string name="menu_exit">Exit</string>
+    <string name="home_news_marquee">News: Edited APKs are saved automatically to Download/ApkEditor for ZArchiver — V1, V2 &amp; V3 signing enabled with 4KB native library alignment.</string>
+
+    <!-- Select App Screen -->
+    <string name="title_select_application">Select an application</string>
+    <string name="search_hint">Please input a keyword to search</string>
+    <string name="filter_user_apps">Show User Apps</string>
+    <string name="filter_system_apps">Show System Apps</string>
+    <string name="filter_all_apps">Show All Apps</string>
+    <string name="sort_by_name">Sort by Name</string>
+    <string name="empty_apps_message">No matching applications found</string>
+
+    <!-- Edit Mode Dialog -->
+    <string name="dialog_edit_mode_title">Edit mode</string>
+    <string name="edit_mode_full">Full edit</string>
+    <string name="edit_mode_simple">Simple edit</string>
+    <string name="edit_mode_common">Common edit</string>
+    <string name="edit_mode_xml">XML file edit</string>
+
+    <!-- Common Edit Screen -->
+    <string name="label_launcher_icon">Launcher icon</string>
+    <string name="label_app_name">App name</string>
+    <string name="label_package_name">Package name</string>
+    <string name="label_install_location">Install location</string>
+    <string name="label_version_code">Version code</string>
+    <string name="label_version_name">Version name</string>
+    <string name="label_min_sdk_version">Minimum SDK Version</string>
+    <string name="label_target_sdk_version">Target SDK version</string>
+    <string name="install_location_default">Default (not specified)</string>
+    <string name="install_location_auto">Auto (0)</string>
+    <string name="install_location_internal">Internal only (1)</string>
+    <string name="install_location_external">Prefer external (2)</string>
+    <string name="action_close">Close</string>
+    <string name="action_save">Save</string>
+    <string name="action_install_apk">Install APK</string>
+    <string name="action_share">Share</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_replace">Replace</string>
+
+    <!-- Other Screens -->
+    <string name="title_projects">Projects</string>
+    <string name="title_settings">Settings</string>
+    <string name="title_webview">WebView</string>
+    <string name="title_current_activity">Current Activity</string>
+    <string name="title_simple_edit">Simple edit</string>
+    <string name="title_full_edit">Full edit</string>
+    <string name="title_xml_edit">XML file edit</string>
+    <string name="empty_projects_message">No edited APKs found in Download/ApkEditor yet. Edit an app or APK file to see it here.</string>
+
+    <!-- Content Descriptions -->
+    <string name="cd_settings">Settings</string>
+    <string name="cd_more_options">More options</string>
+    <string name="cd_back">Navigate back</string>
+    <string name="cd_search">Search applications</string>
+    <string name="cd_clear_search">Clear search</string>
+    <string name="cd_app_icon">Application icon</string>
+    <string name="cd_change_launcher_icon">Tap to change launcher icon</string>
+</resources>

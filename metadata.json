@@ -1,0 +1,6 @@
+{
+  "name": "APK Editor GM",
+  "description": "Native Android APK metadata, resource, and manifest editor with real binary AXML patching, ZIP alignment, and V1/V2/V3 signing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
