@@ -48,6 +48,7 @@ data class ActiveApkTarget(
   val displayName: String,
   val packageName: String,
   val sourceApkFile: File,
+  val splitApkFiles: List<File> = emptyList(),
   val icon: Bitmap?,
   val manifestInfo: ParsedManifestInfo,
   val isExternalFile: Boolean,
@@ -226,12 +227,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
               if (parsed.targetSdkVersion > 0) parsed.targetSdkVersion else item.targetSdk,
           )
         val finalIcon = icon ?: getAppIcon(item.packageName)
+        val splitFiles = item.splitApkPaths.map { File(it) }.filter { it.exists() && it.canRead() }
         resetPendingFileEdits()
         _activeTarget.value =
           ActiveApkTarget(
             displayName = item.appName,
             packageName = item.packageName,
             sourceApkFile = apkFile,
+            splitApkFiles = splitFiles,
             icon = finalIcon,
             manifestInfo = mergedManifest,
             isExternalFile = false,
@@ -302,7 +305,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     viewModelScope.launch {
       _isLoadingEntries.value = true
       try {
-        _zipEntries.value = ApkEditorEngine.listApkEntries(target.sourceApkFile)
+        _zipEntries.value = ApkEditorEngine.listApkEntries(target.sourceApkFile, target.splitApkFiles)
       } catch (_: Exception) {
         _zipEntries.value = emptyList()
       } finally {
@@ -314,7 +317,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
   suspend fun readEntryPreviewBytes(path: String): ByteArray? {
     _fileReplacements.value[path]?.let { return it }
     val target = _activeTarget.value ?: return null
-    return ApkEditorEngine.extractEntryBytes(target.sourceApkFile, path)
+    return ApkEditorEngine.extractEntryBytes(target.sourceApkFile, path, target.splitApkFiles)
   }
 
   fun replaceZipEntryFromUri(entryPath: String, uri: Uri) {
@@ -373,6 +376,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
           ApkEditorEngine.buildSignAndExportApk(
             context = appContext,
             sourceApkFile = target.sourceApkFile,
+            splitApkFiles = target.splitApkFiles,
             request = request,
             signingOptions = settings.value.toSigningOptions(),
             onProgress = { msg -> _buildState.value = BuildOperationState.InProgress(msg) },

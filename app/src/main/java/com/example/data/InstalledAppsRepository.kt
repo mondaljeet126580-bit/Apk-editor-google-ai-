@@ -18,6 +18,7 @@ data class InstalledAppItem(
   val appName: String,
   val packageName: String,
   val sourceApkPath: String,
+  val splitApkPaths: List<String> = emptyList(),
   val isSystemApp: Boolean,
   val versionName: String,
   val versionCode: Long,
@@ -41,6 +42,8 @@ class InstalledAppsRepository(private val context: Context) {
       packages.mapNotNull { pkgInfo ->
         val appInfo = pkgInfo.applicationInfo ?: return@mapNotNull null
         val sourceDir = appInfo.publicSourceDir ?: appInfo.sourceDir ?: return@mapNotNull null
+        val splitDirs =
+          (appInfo.splitPublicSourceDirs ?: appInfo.splitSourceDirs)?.toList().orEmpty()
         val label =
           try {
             pm.getApplicationLabel(appInfo).toString().ifBlank { pkgInfo.packageName }
@@ -59,6 +62,7 @@ class InstalledAppsRepository(private val context: Context) {
           appName = label,
           packageName = pkgInfo.packageName,
           sourceApkPath = sourceDir,
+          splitApkPaths = splitDirs,
           isSystemApp = isSystem,
           versionName = pkgInfo.versionName ?: "1.0",
           versionCode = vCode,

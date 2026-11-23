@@ -16,6 +16,7 @@ data class ParsedManifestInfo(
   val installLocation: Int = -1, // -1 = not specified, 0 = auto, 1 = internalOnly, 2 = preferExternal
   val minSdkVersion: Int = 26,
   val targetSdkVersion: Int = 34,
+  val isSplitRequired: Boolean = false,
   val permissions: List<String> = emptyList(),
   val activities: List<String> = emptyList(),
   val services: List<String> = emptyList(),
@@ -35,6 +36,8 @@ data class ManifestPatchSpec(
   val installLocation: Int? = null, // -1 removes installLocation attribute
   val minSdkVersion: Int? = null,
   val targetSdkVersion: Int? = null,
+  val stripSplitFlags: Boolean = true,
+  val ensureExtractNativeLibsFalse: Boolean = false,
 )
 
 /**
@@ -42,17 +45,16 @@ data class ManifestPatchSpec(
  *
  * Supports both UTF-8 (FLAG_UTF8 = 0x100) and UTF-16LE string pools,
  * preserves all existing string indices, extends RES_XML_RESOURCE_MAP_TYPE
- * cleanly when inserting new framework attributes, and recalculates all chunk
- * sizes, offsets, 4-byte padding, and root AXML header size accurately.
+ * cleanly when inserting new framework attributes, handles package cloning
+ * (provider authorities, custom permissions, relative component names),
+ * disables Split APK requirement flags for standalone installation on Android 13-15,
+ * and recalculates all chunk sizes, offsets, 4-byte padding, and root header size accurately.
  */
 object AxmlParserAndPatcher {
   private const val RES_STRING_POOL_TYPE = 0x0001
   private const val RES_XML_TYPE = 0x0003
-  private const val RES_XML_START_NAMESPACE_TYPE = 0x0100
-  private const val RES_XML_END_NAMESPACE_TYPE = 0x0101
   private const val RES_XML_START_ELEMENT_TYPE = 0x0102
   private const val RES_XML_END_ELEMENT_TYPE = 0x0103
-  private const val RES_XML_CDATA_TYPE = 0x0104
   private const val RES_XML_RESOURCE_MAP_TYPE = 0x0180
 
   private const val FLAG_SORTED = 0x00000001
@@ -65,15 +67,47 @@ object AxmlParserAndPatcher {
   private const val TYPE_INT_BOOLEAN = 0x12
 
   private const val ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
+  private const val META_SPLITS_REQUIRED = "com.android.vending.splits.required"
 
   // Standard Android framework attribute resource IDs
   const val ATTR_LABEL = 0x01010001
   const val ATTR_NAME = 0x01010003
+  const val ATTR_PERMISSION = 0x01010006
+  const val ATTR_READ_PERMISSION = 0x01010007
+  const val ATTR_WRITE_PERMISSION = 0x01010008
+  const val ATTR_PROCESS = 0x01010011
+  const val ATTR_TASK_AFFINITY = 0x01010012
+  const val ATTR_AUTHORITIES = 0x01010018
+  const val ATTR_VALUE = 0x01010024
+  const val ATTR_TARGET_ACTIVITY = 0x01010202
   const val ATTR_MIN_SDK_VERSION = 0x0101020c
   const val ATTR_VERSION_CODE = 0x0101021b
   const val ATTR_VERSION_NAME = 0x0101021c
   const val ATTR_TARGET_SDK_VERSION = 0x01010270
   const val ATTR_INSTALL_LOCATION = 0x010102b7
+  const val ATTR_EXTRACT_NATIVE_LIBS = 0x010104ea
+  const val ATTR_IS_SPLIT_REQUIRED = 0x01010591
+  const val ATTR_REQUIRED_SPLIT_TYPES = 0x0101064e
+  const val ATTR_SPLIT_TYPES = 0x0101064f
+
+  private val COMPONENT_TAGS =
+    setOf(
+      "application",
+      "activity",
+      "activity-alias",
+      "service",
+      "receiver",
+      "provider",
+      "instrumentation",
+    )
+
+  private val PERMISSION_TAGS =
+    setOf(
+      "permission",
+      "uses-permission",
+      "uses-permission-sdk-23",
+      "uses-permission-sdk-m",
+    )
 
   private data class AxmlAttribute(
     var ns: Int,
@@ -447,6 +481,7 @@ object AxmlParserAndPatcher {
     var installLocation = -1
     var minSdkVersion = 26
     var targetSdkVersion = 34
+    var isSplitRequired = false
     val permissions = mutableListOf<String>()
     val activities = mutableListOf<String>()
     val services = mutableListOf<String>()
@@ -494,13 +529,18 @@ object AxmlParserAndPatcher {
                 }
               }
               "application" -> {
-                if (attrResId == ATTR_LABEL || attrName == "label") {
-                  if (attr.dataType == TYPE_REFERENCE) {
-                    isLabelResourceRef = true
-                    appLabel = "@0x${attr.data.toUInt().toString(16)}"
-                  } else {
-                    isLabelResourceRef = false
-                    appLabel = resolveStringValue(attr, pool)
+                when {
+                  attrResId == ATTR_LABEL || attrName == "label" -> {
+                    if (attr.dataType == TYPE_REFERENCE) {
+                      isLabelResourceRef = true
+                      appLabel = "@0x${attr.data.toUInt().toString(16)}"
+                    } else {
+                      isLabelResourceRef = false
+                      appLabel = resolveStringValue(attr, pool)
+                    }
+                  }
+                  attrResId == ATTR_IS_SPLIT_REQUIRED || attrName == "isSplitRequired" -> {
+                    if (attr.data != 0) isSplitRequired = true
                   }
                 }
               }
@@ -566,6 +606,7 @@ object AxmlParserAndPatcher {
       installLocation = installLocation,
       minSdkVersion = minSdkVersion,
       targetSdkVersion = targetSdkVersion,
+      isSplitRequired = isSplitRequired,
       permissions = permissions.distinct(),
       activities = activities.distinct(),
       services = services.distinct(),
@@ -590,52 +631,80 @@ object AxmlParserAndPatcher {
 
     val androidNsIdx = pool.findOrAdd(ANDROID_NAMESPACE)
 
-    fun ensureAttrNameIndex(attrName: String, attrResId: Int): Int {
-      val existingByResId = resIds.indexOf(attrResId)
+    // Pre-scan original package name for cloning conflict resolution
+    var originalPackageName = ""
+    for (chunk in chunks) {
+      if (chunk.type != RES_XML_START_ELEMENT_TYPE) continue
+      val el = parseStartElement(chunk.bytes)
+      if (pool.getOrNull(el.name) == "manifest") {
+        val pkgAttr = el.attributes.firstOrNull { a -> a.ns == -1 && pool.getOrNull(a.name) == "package" }
+        if (pkgAttr != null) {
+          originalPackageName = resolveStringValue(pkgAttr, pool)
+        }
+        break
+      }
+    }
+
+    val requestedNewPackage = patch.packageName?.trim()?.ifBlank { null }
+    val isCloningPackage =
+      requestedNewPackage != null &&
+        originalPackageName.isNotBlank() &&
+        requestedNewPackage != originalPackageName
+
+    fun attrResId(a: AxmlAttribute): Int = if (a.name in resIds.indices) resIds[a.name] else 0
+
+    fun ensureAttrNameIndex(attrName: String, targetResId: Int): Int {
+      val existingByResId = resIds.indexOf(targetResId)
       if (existingByResId >= 0) return existingByResId
 
-      // Check if name already exists within resIds range with matching or zero ID
       for (i in resIds.indices) {
-        if (pool.getOrNull(i) == attrName && (resIds[i] == attrResId || resIds[i] == 0)) {
-          resIds[i] = attrResId
+        if (pool.getOrNull(i) == attrName && (resIds[i] == targetResId || resIds[i] == 0)) {
+          resIds[i] = targetResId
           return i
         }
       }
 
-      // Append new string and extend resIds with 0 padding so existing string indices never shift
       val newIdx = pool.appendNew(attrName)
       while (resIds.size <= newIdx) {
         resIds.add(0)
       }
-      resIds[newIdx] = attrResId
+      resIds[newIdx] = targetResId
       return newIdx
+    }
+
+    fun findAttr(el: ParsedStartElement, nsIdx: Int, attrName: String, targetResId: Int?): AxmlAttribute? {
+      return el.attributes.firstOrNull { a ->
+        val aResId = attrResId(a)
+        val aName = pool.getOrNull(a.name)
+        if (targetResId != null) {
+          aResId == targetResId || (a.ns == nsIdx && aName == attrName)
+        } else {
+          a.ns == nsIdx && aName == attrName
+        }
+      }
     }
 
     fun setOrAddStringAttr(
       el: ParsedStartElement,
       nsIdx: Int,
       attrName: String,
-      attrResId: Int?,
+      targetResId: Int?,
       newValue: String,
-    ) {
-      val newValIdx = pool.appendNew(newValue)
-      val target =
-        el.attributes.firstOrNull { a ->
-          val aResId = if (a.name in resIds.indices) resIds[a.name] else 0
-          val aName = pool.getOrNull(a.name)
-          if (attrResId != null) {
-            aResId == attrResId || (a.ns == nsIdx && aName == attrName)
-          } else {
-            a.ns == nsIdx && aName == attrName
-          }
-        }
+    ): Boolean {
+      val target = findAttr(el, nsIdx, attrName, targetResId)
       if (target != null) {
+        if (target.dataType == TYPE_STRING && resolveStringValue(target, pool) == newValue) {
+          return false
+        }
+        val newValIdx = pool.appendNew(newValue)
         target.rawValue = newValIdx
         target.dataType = TYPE_STRING
         target.data = newValIdx
+        return true
       } else {
+        val newValIdx = pool.appendNew(newValue)
         val nameIdx =
-          if (attrResId != null) ensureAttrNameIndex(attrName, attrResId)
+          if (targetResId != null) ensureAttrNameIndex(attrName, targetResId)
           else pool.findOrAdd(attrName)
         el.attributes.add(
           AxmlAttribute(
@@ -648,6 +717,7 @@ object AxmlParserAndPatcher {
             data = newValIdx,
           )
         )
+        return true
       }
     }
 
@@ -655,21 +725,20 @@ object AxmlParserAndPatcher {
       el: ParsedStartElement,
       nsIdx: Int,
       attrName: String,
-      attrResId: Int,
+      targetResId: Int,
       intValue: Int,
-    ) {
-      val target =
-        el.attributes.firstOrNull { a ->
-          val aResId = if (a.name in resIds.indices) resIds[a.name] else 0
-          val aName = pool.getOrNull(a.name)
-          aResId == attrResId || (a.ns == nsIdx && aName == attrName)
-        }
+    ): Boolean {
+      val target = findAttr(el, nsIdx, attrName, targetResId)
       if (target != null) {
+        if (target.dataType == TYPE_INT_DEC && target.data == intValue) {
+          return false
+        }
         target.rawValue = -1
         target.dataType = TYPE_INT_DEC
         target.data = intValue
+        return true
       } else {
-        val nameIdx = ensureAttrNameIndex(attrName, attrResId)
+        val nameIdx = ensureAttrNameIndex(attrName, targetResId)
         el.attributes.add(
           AxmlAttribute(
             ns = nsIdx,
@@ -681,15 +750,51 @@ object AxmlParserAndPatcher {
             data = intValue,
           )
         )
+        return true
       }
     }
 
-    fun removeAttr(el: ParsedStartElement, attrName: String, attrResId: Int) {
+    fun setOrAddBoolAttr(
+      el: ParsedStartElement,
+      nsIdx: Int,
+      attrName: String,
+      targetResId: Int,
+      boolValue: Boolean,
+    ): Boolean {
+      val intBool = if (boolValue) -1 else 0
+      val target = findAttr(el, nsIdx, attrName, targetResId)
+      if (target != null) {
+        if (target.dataType == TYPE_INT_BOOLEAN && (target.data != 0) == boolValue) {
+          return false
+        }
+        target.rawValue = -1
+        target.dataType = TYPE_INT_BOOLEAN
+        target.data = intBool
+        return true
+      } else {
+        val nameIdx = ensureAttrNameIndex(attrName, targetResId)
+        el.attributes.add(
+          AxmlAttribute(
+            ns = nsIdx,
+            name = nameIdx,
+            rawValue = -1,
+            valueSize = 8,
+            valueRes0 = 0,
+            dataType = TYPE_INT_BOOLEAN,
+            data = intBool,
+          )
+        )
+        return true
+      }
+    }
+
+    fun removeAttr(el: ParsedStartElement, attrName: String, targetResId: Int?): Boolean {
       val idx =
         el.attributes.indexOfFirst { a ->
-          val aResId = if (a.name in resIds.indices) resIds[a.name] else 0
+          val aResId = attrResId(a)
           val aName = pool.getOrNull(a.name)
-          aResId == attrResId || aName == attrName
+          if (targetResId != null) aResId == targetResId || aName == attrName
+          else aName == attrName
         }
       if (idx >= 0) {
         el.attributes.removeAt(idx)
@@ -699,6 +804,32 @@ object AxmlParserAndPatcher {
         else if (el.classIndex > oneBased) el.classIndex--
         if (el.styleIndex == oneBased) el.styleIndex = 0
         else if (el.styleIndex > oneBased) el.styleIndex--
+        return true
+      }
+      return false
+    }
+
+    fun rewritePackagePrefix(value: String, oldPkg: String, newPkg: String): String {
+      return when {
+        value == oldPkg -> newPkg
+        value.startsWith("$oldPkg.") -> newPkg + value.substring(oldPkg.length)
+        value.startsWith("$oldPkg:") -> newPkg + value.substring(oldPkg.length)
+        else -> value
+      }
+    }
+
+    fun rewriteAuthoritiesList(authorities: String, oldPkg: String, newPkg: String): String {
+      return authorities.split(';').joinToString(";") { part ->
+        val trimmed = part.trim()
+        rewritePackagePrefix(trimmed, oldPkg, newPkg)
+      }
+    }
+
+    fun expandRelativeClassName(className: String, oldPkg: String): String {
+      return when {
+        className.startsWith(".") -> oldPkg + className
+        !className.contains(".") -> "$oldPkg.$className"
+        else -> className
       }
     }
 
@@ -715,66 +846,180 @@ object AxmlParserAndPatcher {
       when (tagName) {
         "manifest" -> {
           manifestChunkIdx = i
-          if (!patch.packageName.isNullOrBlank()) {
-            setOrAddStringAttr(el, -1, "package", null, patch.packageName.trim())
-            modified = true
+          if (requestedNewPackage != null) {
+            if (setOrAddStringAttr(el, -1, "package", null, requestedNewPackage)) {
+              modified = true
+            }
           }
           if (patch.versionCode != null) {
-            setOrAddIntAttr(el, androidNsIdx, "versionCode", ATTR_VERSION_CODE, patch.versionCode)
-            modified = true
+            if (setOrAddIntAttr(el, androidNsIdx, "versionCode", ATTR_VERSION_CODE, patch.versionCode)) {
+              modified = true
+            }
           }
           if (!patch.versionName.isNullOrBlank()) {
-            setOrAddStringAttr(
-              el,
-              androidNsIdx,
-              "versionName",
-              ATTR_VERSION_NAME,
-              patch.versionName.trim(),
-            )
-            modified = true
+            if (
+              setOrAddStringAttr(
+                el,
+                androidNsIdx,
+                "versionName",
+                ATTR_VERSION_NAME,
+                patch.versionName.trim(),
+              )
+            ) {
+              modified = true
+            }
           }
           if (patch.installLocation != null) {
             if (patch.installLocation < 0) {
-              removeAttr(el, "installLocation", ATTR_INSTALL_LOCATION)
+              if (removeAttr(el, "installLocation", ATTR_INSTALL_LOCATION)) modified = true
             } else {
-              setOrAddIntAttr(
-                el,
-                androidNsIdx,
-                "installLocation",
-                ATTR_INSTALL_LOCATION,
-                patch.installLocation,
-              )
+              if (
+                setOrAddIntAttr(
+                  el,
+                  androidNsIdx,
+                  "installLocation",
+                  ATTR_INSTALL_LOCATION,
+                  patch.installLocation,
+                )
+              ) {
+                modified = true
+              }
             }
-            modified = true
+          }
+          if (patch.stripSplitFlags) {
+            if (removeAttr(el, "requiredSplitTypes", ATTR_REQUIRED_SPLIT_TYPES)) modified = true
+            if (removeAttr(el, "splitTypes", ATTR_SPLIT_TYPES)) modified = true
+            if (removeAttr(el, "split", null)) modified = true
           }
         }
+
         "application" -> {
           if (!patch.appLabel.isNullOrBlank()) {
-            setOrAddStringAttr(el, androidNsIdx, "label", ATTR_LABEL, patch.appLabel.trim())
-            modified = true
+            if (setOrAddStringAttr(el, androidNsIdx, "label", ATTR_LABEL, patch.appLabel.trim())) {
+              modified = true
+            }
+          }
+          if (patch.stripSplitFlags) {
+            if (removeAttr(el, "isSplitRequired", ATTR_IS_SPLIT_REQUIRED)) modified = true
+          }
+          if (patch.ensureExtractNativeLibsFalse) {
+            val existingExtract = findAttr(el, androidNsIdx, "extractNativeLibs", ATTR_EXTRACT_NATIVE_LIBS)
+            if (existingExtract != null && existingExtract.data == 0) {
+              // Already false (compatible with 16KB-aligned STORED .so files)
+            } else if (existingExtract == null) {
+              // Leaving omitted or false is compatible with 16KB-aligned STORED .so files
+              if (setOrAddBoolAttr(el, androidNsIdx, "extractNativeLibs", ATTR_EXTRACT_NATIVE_LIBS, false)) {
+                modified = true
+              }
+            }
           }
         }
+
         "uses-sdk" -> {
           foundUsesSdk = true
           if (patch.minSdkVersion != null) {
-            setOrAddIntAttr(
-              el,
-              androidNsIdx,
-              "minSdkVersion",
-              ATTR_MIN_SDK_VERSION,
-              patch.minSdkVersion,
-            )
-            modified = true
+            if (
+              setOrAddIntAttr(
+                el,
+                androidNsIdx,
+                "minSdkVersion",
+                ATTR_MIN_SDK_VERSION,
+                patch.minSdkVersion,
+              )
+            ) {
+              modified = true
+            }
           }
           if (patch.targetSdkVersion != null) {
-            setOrAddIntAttr(
-              el,
-              androidNsIdx,
-              "targetSdkVersion",
-              ATTR_TARGET_SDK_VERSION,
-              patch.targetSdkVersion,
-            )
-            modified = true
+            if (
+              setOrAddIntAttr(
+                el,
+                androidNsIdx,
+                "targetSdkVersion",
+                ATTR_TARGET_SDK_VERSION,
+                patch.targetSdkVersion,
+              )
+            ) {
+              modified = true
+            }
+          }
+        }
+
+        "meta-data" -> {
+          if (patch.stripSplitFlags) {
+            val nameAttr = findAttr(el, androidNsIdx, "name", ATTR_NAME)
+            val metaName = nameAttr?.let { resolveStringValue(it, pool) }
+            if (metaName == META_SPLITS_REQUIRED) {
+              if (setOrAddBoolAttr(el, androidNsIdx, "value", ATTR_VALUE, false)) {
+                modified = true
+              }
+            }
+          }
+        }
+      }
+
+      // Cloning package name conflict resolution across all manifest components & permissions
+      if (isCloningPackage && requestedNewPackage != null) {
+        if (tagName == "provider") {
+          val authAttr = findAttr(el, androidNsIdx, "authorities", ATTR_AUTHORITIES)
+          if (authAttr != null && authAttr.dataType == TYPE_STRING) {
+            val oldAuth = resolveStringValue(authAttr, pool)
+            val newAuth = rewriteAuthoritiesList(oldAuth, originalPackageName, requestedNewPackage)
+            if (newAuth != oldAuth) {
+              val newIdx = pool.appendNew(newAuth)
+              authAttr.rawValue = newIdx
+              authAttr.data = newIdx
+              modified = true
+            }
+          }
+        }
+
+        if (tagName in PERMISSION_TAGS) {
+          val permNameAttr = findAttr(el, androidNsIdx, "name", ATTR_NAME)
+          if (permNameAttr != null && permNameAttr.dataType == TYPE_STRING) {
+            val oldPerm = resolveStringValue(permNameAttr, pool)
+            val newPerm = rewritePackagePrefix(oldPerm, originalPackageName, requestedNewPackage)
+            if (newPerm != oldPerm) {
+              val newIdx = pool.appendNew(newPerm)
+              permNameAttr.rawValue = newIdx
+              permNameAttr.data = newIdx
+              modified = true
+            }
+          }
+        }
+
+        if (tagName in COMPONENT_TAGS) {
+          // Preserve DEX class resolution for relative android:name & android:targetActivity
+          for (attr in el.attributes) {
+            if (attr.dataType != TYPE_STRING) continue
+            val rId = attrResId(attr)
+            val aName = pool.getOrNull(attr.name)
+            when {
+              rId == ATTR_NAME || (attr.ns == androidNsIdx && aName == "name") ||
+                rId == ATTR_TARGET_ACTIVITY || (attr.ns == androidNsIdx && aName == "targetActivity") -> {
+                val origClass = resolveStringValue(attr, pool)
+                if (origClass.isNotBlank()) {
+                  val expanded = expandRelativeClassName(origClass, originalPackageName)
+                  if (expanded != origClass) {
+                    val newIdx = pool.appendNew(expanded)
+                    attr.rawValue = newIdx
+                    attr.data = newIdx
+                    modified = true
+                  }
+                }
+              }
+              rId == ATTR_PERMISSION || rId == ATTR_READ_PERMISSION || rId == ATTR_WRITE_PERMISSION ||
+                rId == ATTR_PROCESS || rId == ATTR_TASK_AFFINITY -> {
+                val origVal = resolveStringValue(attr, pool)
+                val updated = rewritePackagePrefix(origVal, originalPackageName, requestedNewPackage)
+                if (updated != origVal) {
+                  val newIdx = pool.appendNew(updated)
+                  attr.rawValue = newIdx
+                  attr.data = newIdx
+                  modified = true
+                }
+              }
+            }
           }
         }
       }
@@ -785,7 +1030,11 @@ object AxmlParserAndPatcher {
     }
 
     // If the APK had no <uses-sdk> element and the user edited minSdk/targetSdk, insert one cleanly
-    if (!foundUsesSdk && manifestChunkIdx >= 0 && (patch.minSdkVersion != null || patch.targetSdkVersion != null)) {
+    if (
+      !foundUsesSdk &&
+        manifestChunkIdx >= 0 &&
+        (patch.minSdkVersion != null || patch.targetSdkVersion != null)
+    ) {
       val usesSdkTagIdx = pool.findOrAdd("uses-sdk")
       val newEl =
         ParsedStartElement(
@@ -825,12 +1074,15 @@ object AxmlParserAndPatcher {
       chunks.add(manifestChunkIdx + 2, endChunk)
     }
 
-    // Rebuild StringPool and ResourceMap chunks
+    // Rebuild StringPool and ResourceMap chunks with accurate offsets & 4-byte padding
     chunks[stringPoolIndex].bytes = pool.encode()
     if (resMapIndex >= 0) {
       chunks[resMapIndex].bytes = encodeResourceMap(resIds)
     } else if (resIds.isNotEmpty()) {
-      chunks.add(stringPoolIndex + 1, RawChunk(RES_XML_RESOURCE_MAP_TYPE, 8, encodeResourceMap(resIds)))
+      chunks.add(
+        stringPoolIndex + 1,
+        RawChunk(RES_XML_RESOURCE_MAP_TYPE, 8, encodeResourceMap(resIds)),
+      )
     }
 
     // Assemble complete binary XML with accurate total file size in 8-byte root header

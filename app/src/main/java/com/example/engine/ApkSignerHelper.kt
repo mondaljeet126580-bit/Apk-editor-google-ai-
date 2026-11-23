@@ -47,11 +47,16 @@ object ApkSignerHelper {
 
   @Synchronized
   fun ensureKeystore(context: Context, forceRegenerate: Boolean = false): File {
-    val file = keystoreFile(context)
+    return ensureKeystoreAtFile(keystoreFile(context), forceRegenerate)
+  }
+
+  @Synchronized
+  internal fun ensureKeystoreAtFile(file: File, forceRegenerate: Boolean = false): File {
     if (!forceRegenerate && file.exists() && file.length() > 0) {
       return file
     }
 
+    file.parentFile?.mkdirs()
     val keyPairGen = KeyPairGenerator.getInstance("RSA")
     keyPairGen.initialize(2048, SecureRandom())
     val keyPair = keyPairGen.generateKeyPair()
@@ -108,9 +113,17 @@ object ApkSignerHelper {
     outputSignedApk: File,
     options: SigningOptions = SigningOptions(),
   ) {
-    val ksFile = ensureKeystore(context)
+    signApkWithKeystore(ensureKeystore(context), inputUnsignedApk, outputSignedApk, options)
+  }
+
+  internal fun signApkWithKeystore(
+    keystoreFile: File,
+    inputUnsignedApk: File,
+    outputSignedApk: File,
+    options: SigningOptions = SigningOptions(),
+  ) {
     val keyStore = KeyStore.getInstance("PKCS12")
-    FileInputStream(ksFile).use { input -> keyStore.load(input, STORE_PASSWORD) }
+    FileInputStream(keystoreFile).use { input -> keyStore.load(input, STORE_PASSWORD) }
 
     val privateKey = keyStore.getKey(KEY_ALIAS, STORE_PASSWORD) as PrivateKey
     val certificate = keyStore.getCertificate(KEY_ALIAS) as X509Certificate
@@ -118,11 +131,17 @@ object ApkSignerHelper {
     val signerConfig =
       ApkSigner.SignerConfig.Builder(KEY_ALIAS, privateKey, listOf(certificate)).build()
 
+    // Ensure at least V2 & V3 are enabled when signing modern Android 11-15+ APKs
+    val v1 = options.v1Enabled
+    val v2 = options.v2Enabled || (!options.v1Enabled && !options.v3Enabled)
+    val v3 = options.v3Enabled
+
     val signer =
       ApkSigner.Builder(listOf(signerConfig))
-        .setV1SigningEnabled(options.v1Enabled)
-        .setV2SigningEnabled(options.v2Enabled)
-        .setV3SigningEnabled(options.v3Enabled)
+        .setV1SigningEnabled(v1)
+        .setV2SigningEnabled(v2)
+        .setV3SigningEnabled(v3)
+        .setOtherSignersSignaturesPreserved(false)
         .setCreatedBy("APK Editor GM")
         .setInputApk(inputUnsignedApk)
         .setOutputApk(outputSignedApk)
