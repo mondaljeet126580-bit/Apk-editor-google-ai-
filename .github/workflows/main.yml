@@ -22,6 +22,43 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
+      - name: Generate missing debug.keystore
+        run: |
+          if [ ! -f "debug.keystore" ]; then
+            python3 - << 'EOF'
+          import re, pathlib, subprocess
+
+          text = ""
+          for p in [pathlib.Path("app/build.gradle.kts"), pathlib.Path("app/build.gradle")]:
+              if p.exists():
+                  text = p.read_text()
+                  break
+
+          m = re.search(r'debugConfig[^\{\}]*\{([^}]*)\}', text)
+          block = m.group(1) if m else text
+
+          def find_val(key, default):
+              res = re.search(rf'{key}\s*=?\s*["\']([^"\']+)["\']', block)
+              return res.group(1) if res else default
+
+          store_pass = find_val('storePassword', 'android')
+          key_alias = find_val('keyAlias', 'androiddebugkey')
+          key_pass = find_val('keyPassword', 'android')
+
+          subprocess.run([
+              "keytool", "-genkey", "-v",
+              "-keystore", "debug.keystore",
+              "-storepass", store_pass,
+              "-alias", key_alias,
+              "-keypass", key_pass,
+              "-keyalg", "RSA",
+              "-keysize", "2048",
+              "-validity", "10000",
+              "-dname", "CN=Android Debug,O=Android,C=US"
+          ], check=True)
+          EOF
+          fi
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
@@ -29,9 +66,9 @@ jobs:
         run: |
           if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
-            ./gradlew assembleDebug --stacktrace
+            ./gradlew assembleDebug
           else
-            gradle assembleDebug --stacktrace
+            gradle assembleDebug
           fi
 
       - name: Create Release & Upload APK
