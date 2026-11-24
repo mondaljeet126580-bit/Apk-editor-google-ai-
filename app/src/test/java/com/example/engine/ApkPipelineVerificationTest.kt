@@ -6,6 +6,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
@@ -24,15 +25,23 @@ class ApkPipelineVerificationTest {
   val tempFolder = TemporaryFolder()
 
   @Test
-  fun testSplitMergeClone16KbAlignAndV1V2V3Sign() {
+  fun testSizeOptimizedSplitMergeCloneAndV1V2V3Sign() {
     val baseApk = tempFolder.newFile("base.apk")
     val arm64SplitApk = tempFolder.newFile("split_config.arm64_v8a.apk")
+    val x86SplitApk = tempFolder.newFile("split_config.x86_64.apk")
     val dpiSplitApk = tempFolder.newFile("split_config.xxhdpi.apk")
-    val unsignedAlignedApk = tempFolder.newFile("unsigned_aligned.apk")
+    val unsignedOptimizedApk = tempFolder.newFile("unsigned_optimized.apk")
     val signedApk = tempFolder.newFile("signed_final.apk")
     val keystoreFile = File(tempFolder.root, "test_signing.p12")
 
-    // 1. Build synthetic base.apk (like Bing Target SDK 36 Split APK with old signatures)
+    // Highly compressible payloads simulating bloated STORED DEX, JSON assets, and native .so
+    val fakeDexBytes = ("dex\n039\u0000" + "Lcom/microsoft/bing/MainActivity;".repeat(2000)).toByteArray()
+    val fakeAssetJson = ("{\"feature\":\"search\",\"enabled\":true},".repeat(1500)).toByteArray()
+    val fakeMediaMp4 = ByteArray(1024) { ((it * 31) and 0xFF).toByte() }
+    val fakeArm64So = ByteArray(64 * 1024) { (it % 16).toByte() }
+    val fakeArmeabiSo = ByteArray(32 * 1024) { (it % 13).toByte() }
+
+    // 1. Build synthetic base.apk (like Bing Target SDK 36 Split APK with STORED DEX, old signatures, and build metadata)
     val baseManifest = buildBingLikeSplitManifest()
     ZipOutputStream(FileOutputStream(baseApk)).use { zos ->
       zos.putNextEntry(ZipEntry("AndroidManifest.xml"))
@@ -43,11 +52,15 @@ class ApkPipelineVerificationTest {
       zos.write(ByteArray(256) { (it and 0xFF).toByte() })
       zos.closeEntry()
 
-      zos.putNextEntry(ZipEntry("classes.dex"))
-      zos.write("dex\n039\u0000dummy_dex_payload".toByteArray())
-      zos.closeEntry()
+      // Store classes.dex uncompressed in source APK to verify we recompress it at level 9
+      writeRawStored(zos, "classes.dex", fakeDexBytes)
+      writeRawStored(zos, "assets/config.json", fakeAssetJson)
+      writeRawStored(zos, "assets/intro.mp4", fakeMediaMp4)
+      // Redundant non-arm64 ABI inside base APK
+      writeRawStored(zos, "lib/armeabi-v7a/liblegacy.so", fakeArmeabiSo)
+      writeRawStored(zos, "lib/x86/libsim.so", fakeArmeabiSo)
 
-      // Old signatures that MUST be stripped
+      // Old signatures & Gradle build metadata that MUST be stripped
       zos.putNextEntry(ZipEntry("META-INF/MANIFEST.MF"))
       zos.write("Manifest-Version: 1.0\n".toByteArray())
       zos.closeEntry()
@@ -57,34 +70,33 @@ class ApkPipelineVerificationTest {
       zos.putNextEntry(ZipEntry("META-INF/OLDKEY.RSA"))
       zos.write(ByteArray(64) { 0x42 })
       zos.closeEntry()
+      zos.putNextEntry(ZipEntry("META-INF/com/android/build/gradle/app-metadata.properties"))
+      zos.write("appMetadataVersion=1.1\n".toByteArray())
+      zos.closeEntry()
       zos.putNextEntry(ZipEntry("stamp-cert-sha256"))
       zos.write(ByteArray(32) { 0x11 })
       zos.closeEntry()
     }
 
-    // 2. Build synthetic arm64-v8a split APK (with compressed .so to verify forced STORED + 16KB align)
+    // 2. Build synthetic arm64-v8a split APK
     ZipOutputStream(FileOutputStream(arm64SplitApk)).use { zos ->
       zos.putNextEntry(ZipEntry("AndroidManifest.xml"))
       zos.write("split_manifest_must_be_ignored".toByteArray())
       zos.closeEntry()
-
-      zos.putNextEntry(ZipEntry("lib/arm64-v8a/libbing_native.so"))
-      zos.write(ByteArray(4096) { (it % 127).toByte() })
-      zos.closeEntry()
+      writeRawStored(zos, "lib/arm64-v8a/libbing_native.so", fakeArm64So)
     }
 
-    // 3. Build synthetic DPI/feature split APK
+    // 3. Build unused x86_64 split APK (must be excluded completely)
+    ZipOutputStream(FileOutputStream(x86SplitApk)).use { zos ->
+      writeRawStored(zos, "lib/x86_64/libbing_native.so", fakeArm64So)
+    }
+
+    // 4. Build synthetic DPI/feature split APK
     ZipOutputStream(FileOutputStream(dpiSplitApk)).use { zos ->
-      zos.putNextEntry(ZipEntry("res/drawable-xxhdpi-v4/banner.png"))
-      zos.write(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A))
-      zos.closeEntry()
-
-      zos.putNextEntry(ZipEntry("classes.dex"))
-      zos.write("dex\n039\u0000feature_split_dex".toByteArray())
-      zos.closeEntry()
+      writeRawStored(zos, "res/drawable-xxhdpi-v4/banner.webp", ByteArray(512) { 0x55 })
+      writeRawStored(zos, "classes.dex", fakeDexBytes)
     }
 
-    // 4. Run full repack + split merge + clone manifest patch + 4B/16KB alignment
     val request =
       ApkEditRequest(
         manifestPatch =
@@ -101,44 +113,75 @@ class ApkPipelineVerificationTest {
 
     ApkEditorEngine.repackAndAlignApk(
       sourceApkFile = baseApk,
-      splitApkFiles = listOf(dpiSplitApk, arm64SplitApk),
-      outputUnsignedApk = unsignedAlignedApk,
+      splitApkFiles = listOf(dpiSplitApk, x86SplitApk, arm64SplitApk),
+      outputUnsignedApk = unsignedOptimizedApk,
       request = request,
     )
 
-    // 5. Sign AFTER alignment with V1 + V2 + V3 using auto-generated 2048-bit RSA PKCS12 keystore
+    // Sign AFTER repacking/alignment with V1 + V2 + V3
     ApkSignerHelper.ensureKeystoreAtFile(keystoreFile)
     ApkSignerHelper.signApkWithKeystore(
       keystoreFile = keystoreFile,
-      inputUnsignedApk = unsignedAlignedApk,
+      inputUnsignedApk = unsignedOptimizedApk,
       outputSignedApk = signedApk,
       options = SigningOptions(v1Enabled = true, v2Enabled = true, v3Enabled = true),
     )
 
-    // 6. Verify V1 + V2 + V3 signatures with Google's official ApkVerifier!
+    // Verify V1 + V2 + V3 signatures with Google's official ApkVerifier
     val verifyResult = ApkVerifier.Builder(signedApk).setMinCheckedPlatformVersion(23).build().verify()
     assertTrue("APK verification failed: ${verifyResult.errors}", verifyResult.isVerified)
     assertTrue("V1 signature missing", verifyResult.isVerifiedUsingV1Scheme)
     assertTrue("V2 signature missing", verifyResult.isVerifiedUsingV2Scheme)
     assertTrue("V3 signature missing", verifyResult.isVerifiedUsingV3Scheme)
 
-    // 7. Verify merged entries, stripped old signatures, and patched binary AndroidManifest.xml
+    // Verify size reduction (uncompressed inputs > 250 KB, signed optimized APK should be tiny!)
+    val combinedInputBytes = baseApk.length() + arm64SplitApk.length() + dpiSplitApk.length()
+    assertTrue(
+      "Expected huge size reduction! Combined inputs=$combinedInputBytes, signed=${signedApk.length()}",
+      signedApk.length() < combinedInputBytes / 4,
+    )
+
+    // Verify ZIP entries, compression methods, stripped ABIs, and patched AXML
     ZipFile(signedApk).use { zip ->
-      assertNull("Old signature OLDKEY.RSA was not stripped!", zip.getEntry("META-INF/OLDKEY.RSA"))
-      assertNull("Old signature OLDKEY.SF was not stripped!", zip.getEntry("META-INF/OLDKEY.SF"))
-      assertNull("Play stamp-cert-sha256 was not stripped!", zip.getEntry("stamp-cert-sha256"))
+      assertNull("Old signature OLDKEY.RSA not stripped", zip.getEntry("META-INF/OLDKEY.RSA"))
+      assertNull("Old signature OLDKEY.SF not stripped", zip.getEntry("META-INF/OLDKEY.SF"))
+      assertNull("Play stamp-cert-sha256 not stripped", zip.getEntry("stamp-cert-sha256"))
+      assertNull(
+        "Gradle build metadata not stripped",
+        zip.getEntry("META-INF/com/android/build/gradle/app-metadata.properties"),
+      )
 
+      // Unused architectures must be stripped
+      assertNull("armeabi-v7a should be stripped when arm64-v8a exists", zip.getEntry("lib/armeabi-v7a/liblegacy.so"))
+      assertNull("x86 should be stripped", zip.getEntry("lib/x86/libsim.so"))
+      assertNull("x86_64 split should be stripped", zip.getEntry("lib/x86_64/libbing_native.so"))
+
+      // resources.arsc MUST stay STORED
       val arscEntry = zip.getEntry("resources.arsc")
-      assertNotNull("resources.arsc missing", arscEntry)
-      assertEquals("resources.arsc must be STORED", ZipEntry.STORED, arscEntry!!.method)
+      assertNotNull(arscEntry)
+      assertEquals("resources.arsc must remain STORED", ZipEntry.STORED, arscEntry!!.method)
 
-      val soEntry = zip.getEntry("lib/arm64-v8a/libbing_native.so")
-      assertNotNull("arm64-v8a split native library was not merged!", soEntry)
-      assertEquals(".so native lib must be STORED", ZipEntry.STORED, soEntry!!.method)
+      // Already-compressed media MUST stay STORED
+      val mp4Entry = zip.getEntry("assets/intro.mp4")
+      assertNotNull(mp4Entry)
+      assertEquals("mp4 media must stay STORED", ZipEntry.STORED, mp4Entry!!.method)
+      val webpEntry = zip.getEntry("res/drawable-xxhdpi-v4/banner.webp")
+      assertNotNull(webpEntry)
+      assertEquals("webp media must stay STORED", ZipEntry.STORED, webpEntry!!.method)
 
-      assertNotNull("DPI split resource was not merged!", zip.getEntry("res/drawable-xxhdpi-v4/banner.png"))
-      assertNotNull("Feature split dex was not merged as classes2.dex!", zip.getEntry("classes2.dex"))
+      // DEX, JSON assets, and arm64-v8a .so MUST be DEFLATED (level 9)
+      val dex1 = zip.getEntry("classes.dex")!!
+      val dex2 = zip.getEntry("classes2.dex")!!
+      val jsonEntry = zip.getEntry("assets/config.json")!!
+      val arm64So = zip.getEntry("lib/arm64-v8a/libbing_native.so")!!
 
+      assertEquals("classes.dex must be DEFLATED", ZipEntry.DEFLATED, dex1.method)
+      assertEquals("classes2.dex must be DEFLATED", ZipEntry.DEFLATED, dex2.method)
+      assertEquals("assets/config.json must be DEFLATED", ZipEntry.DEFLATED, jsonEntry.method)
+      assertEquals("arm64-v8a .so must be DEFLATED when extractNativeLibs=true", ZipEntry.DEFLATED, arm64So.method)
+      assertTrue("Expected strong .so compression", arm64So.compressedSize < arm64So.size / 10)
+
+      // Verify binary AndroidManifest.xml integrity, cloning, split-stripping, and extractNativeLibs=true
       val patchedManifestBytes = zip.getInputStream(zip.getEntry("AndroidManifest.xml")).use { it.readBytes() }
       val parsed = AxmlParserAndPatcher.parseManifestInfo(patchedManifestBytes)
       assertEquals("com.microsoft.bing1", parsed.packageName)
@@ -147,54 +190,38 @@ class ApkPipelineVerificationTest {
       assertEquals("31.9.430611026", parsed.versionName)
       assertEquals(30, parsed.minSdkVersion)
       assertEquals(36, parsed.targetSdkVersion)
-      assertFalse("isSplitRequired should be stripped!", parsed.isSplitRequired)
+      assertEquals("extractNativeLibs must be true!", true, parsed.extractNativeLibs)
+      assertFalse("isSplitRequired should be stripped", parsed.isSplitRequired)
 
-      // Check cloning rewrites in decoded XML
       val xml = parsed.xmlPreview
-      assertTrue(
-        "Provider authorities were not renamed on clone! XML:\n$xml",
-        xml.contains("com.microsoft.bing1.fileprovider;com.microsoft.bing1.androidx-startup"),
-      )
-      assertTrue(
-        "Custom permission was not renamed on clone! XML:\n$xml",
-        xml.contains("com.microsoft.bing1.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"),
-      )
-      assertTrue(
-        "Relative activity class name should expand to original package! XML:\n$xml",
-        xml.contains("com.microsoft.bing.MainActivity"),
-      )
-      assertFalse(
-        "android:isSplitRequired must be removed! XML:\n$xml",
-        xml.contains("isSplitRequired"),
-      )
-      assertTrue(
-        "com.android.vending.splits.required should be false! XML:\n$xml",
-        xml.contains("com.android.vending.splits.required") && xml.contains("value=\"false\""),
-      )
+      assertTrue(xml.contains("com.microsoft.bing1.fileprovider;com.microsoft.bing1.androidx-startup"))
+      assertTrue(xml.contains("com.microsoft.bing1.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"))
+      assertTrue(xml.contains("com.microsoft.bing.MainActivity"))
+      assertFalse(xml.contains("isSplitRequired"))
+      assertTrue(xml.contains("extractNativeLibs=\"true\""))
     }
 
-    // 8. Mathematically verify raw ZIP Local File Header data offsets in the FINAL SIGNED APK!
+    // Mathematically verify resources.arsc 4-byte alignment in the FINAL SIGNED APK
     val offsets = inspectZipDataOffsets(signedApk)
     val arscOffset = offsets["resources.arsc"]
-    val soOffset = offsets["lib/arm64-v8a/libbing_native.so"]
     assertNotNull("Could not locate resources.arsc LFH", arscOffset)
-    assertNotNull("Could not locate .so LFH", soOffset)
-    assertEquals(
-      "resources.arsc offset $arscOffset is not 4-byte aligned in final signed APK!",
-      0L,
-      arscOffset!! % 4L,
-    )
-    assertEquals(
-      "lib/arm64-v8a/libbing_native.so offset $soOffset is not 16384-byte (16KB) aligned in final signed APK!",
-      0L,
-      soOffset!! % 16384L,
-    )
+    assertEquals("resources.arsc must be 4-byte aligned in final signed APK", 0L, arscOffset!! % 4L)
   }
 
-  /**
-   * Walks ZIP Local File Headers directly from raw bytes to compute the exact
-   * byte offset of each entry's payload data inside the APK.
-   */
+  private fun writeRawStored(zos: ZipOutputStream, name: String, data: ByteArray) {
+    val crc = CRC32().apply { update(data) }.value
+    val entry =
+      ZipEntry(name).apply {
+        method = ZipEntry.STORED
+        size = data.size.toLong()
+        compressedSize = data.size.toLong()
+        this.crc = crc
+      }
+    zos.putNextEntry(entry)
+    zos.write(data)
+    zos.closeEntry()
+  }
+
   private fun inspectZipDataOffsets(apkFile: File): Map<String, Long> {
     val bytes = apkFile.readBytes()
     val buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
@@ -202,7 +229,7 @@ class ApkPipelineVerificationTest {
     var pos = 0
     while (pos + 30 <= bytes.size) {
       val sig = buf.getInt(pos)
-      if (sig != 0x04034b50) break // End of Local File Headers
+      if (sig != 0x04034b50) break
       val flags = buf.getShort(pos + 6).toInt() and 0xFFFF
       val compSize = buf.getInt(pos + 18).toLong() and 0xFFFFFFFFL
       val nameLen = buf.getShort(pos + 26).toInt() and 0xFFFF
@@ -212,7 +239,6 @@ class ApkPipelineVerificationTest {
       result[name] = dataStart.toLong()
 
       if ((flags and 0x0008) != 0) {
-        // Data descriptor present (DEFLATED): scan forward for next LFH or APK Sig / CD header
         var scan = dataStart
         while (scan + 4 <= bytes.size) {
           val nextSig = buf.getInt(scan)
@@ -228,39 +254,39 @@ class ApkPipelineVerificationTest {
   }
 
   private fun buildBingLikeSplitManifest(): ByteArray {
-    // 0: label, 1: name, 2: authorities, 3: value, 4: minSdkVersion, 5: versionCode,
-    // 6: versionName, 7: targetSdkVersion, 8: isSplitRequired, 9: requiredSplitTypes
+    // Includes extractNativeLibs=false to verify it gets cleanly flipped to true
     val strings =
       listOf(
-        "label",
-        "name",
-        "authorities",
-        "value",
-        "minSdkVersion",
-        "versionCode",
-        "versionName",
-        "targetSdkVersion",
-        "isSplitRequired",
-        "requiredSplitTypes",
-        "http://schemas.android.com/apk/res/android", // 10
-        "manifest", // 11
-        "package", // 12
-        "com.microsoft.bing", // 13
-        "31.9.430611026", // 14
-        "arm64_v8a", // 15
-        "uses-sdk", // 16
-        "permission", // 17
-        "com.microsoft.bing.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION", // 18
-        "uses-permission", // 19
-        "application", // 20
-        "Bing", // 21
-        "activity", // 22
-        ".MainActivity", // 23
-        "provider", // 24
-        "com.microsoft.bing.BingFileProvider", // 25
-        "com.microsoft.bing.fileprovider;com.microsoft.bing.androidx-startup", // 26
-        "meta-data", // 27
-        "com.android.vending.splits.required", // 28
+        "label", // 0
+        "name", // 1
+        "authorities", // 2
+        "value", // 3
+        "minSdkVersion", // 4
+        "versionCode", // 5
+        "versionName", // 6
+        "targetSdkVersion", // 7
+        "extractNativeLibs", // 8
+        "isSplitRequired", // 9
+        "requiredSplitTypes", // 10
+        "http://schemas.android.com/apk/res/android", // 11
+        "manifest", // 12
+        "package", // 13
+        "com.microsoft.bing", // 14
+        "31.9.430611026", // 15
+        "arm64_v8a", // 16
+        "uses-sdk", // 17
+        "permission", // 18
+        "com.microsoft.bing.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION", // 19
+        "uses-permission", // 20
+        "application", // 21
+        "Bing", // 22
+        "activity", // 23
+        ".MainActivity", // 24
+        "provider", // 25
+        "com.microsoft.bing.BingFileProvider", // 26
+        "com.microsoft.bing.fileprovider;com.microsoft.bing.androidx-startup", // 27
+        "meta-data", // 28
+        "com.android.vending.splits.required", // 29
       )
     val resIds =
       intArrayOf(
@@ -272,6 +298,7 @@ class ApkPipelineVerificationTest {
         AxmlParserAndPatcher.ATTR_VERSION_CODE,
         AxmlParserAndPatcher.ATTR_VERSION_NAME,
         AxmlParserAndPatcher.ATTR_TARGET_SDK_VERSION,
+        AxmlParserAndPatcher.ATTR_EXTRACT_NATIVE_LIBS,
         AxmlParserAndPatcher.ATTR_IS_SPLIT_REQUIRED,
         AxmlParserAndPatcher.ATTR_REQUIRED_SPLIT_TYPES,
       )
@@ -281,53 +308,54 @@ class ApkPipelineVerificationTest {
         encodeSp(strings),
         encodeRm(resIds),
         encodeStart(
-          11,
+          12,
           listOf(
-            intArrayOf(-1, 12, 13, 0x03, 13), // package
-            intArrayOf(10, 5, -1, 0x10, 430611026), // versionCode
-            intArrayOf(10, 6, 14, 0x03, 14), // versionName
-            intArrayOf(10, 9, 15, 0x03, 15), // requiredSplitTypes
+            intArrayOf(-1, 13, 14, 0x03, 14),
+            intArrayOf(11, 5, -1, 0x10, 430611026),
+            intArrayOf(11, 6, 15, 0x03, 15),
+            intArrayOf(11, 10, 16, 0x03, 16),
           ),
         ),
         encodeStart(
-          16,
+          17,
           listOf(
-            intArrayOf(10, 4, -1, 0x10, 30), // minSdkVersion=30
-            intArrayOf(10, 7, -1, 0x10, 36), // targetSdkVersion=36
+            intArrayOf(11, 4, -1, 0x10, 30),
+            intArrayOf(11, 7, -1, 0x10, 36),
           ),
         ),
-        encodeEnd(16),
-        encodeStart(17, listOf(intArrayOf(10, 1, 18, 0x03, 18))), // <permission>
         encodeEnd(17),
-        encodeStart(19, listOf(intArrayOf(10, 1, 18, 0x03, 18))), // <uses-permission>
-        encodeEnd(19),
+        encodeStart(18, listOf(intArrayOf(11, 1, 19, 0x03, 19))),
+        encodeEnd(18),
+        encodeStart(20, listOf(intArrayOf(11, 1, 19, 0x03, 19))),
+        encodeEnd(20),
         encodeStart(
-          20,
+          21,
           listOf(
-            intArrayOf(10, 0, 21, 0x03, 21), // label="Bing"
-            intArrayOf(10, 8, -1, 0x12, -1), // isSplitRequired=true
+            intArrayOf(11, 0, 22, 0x03, 22),
+            intArrayOf(11, 8, -1, 0x12, 0), // extractNativeLibs="false"
+            intArrayOf(11, 9, -1, 0x12, -1), // isSplitRequired="true"
           ),
         ),
-        encodeStart(22, listOf(intArrayOf(10, 1, 23, 0x03, 23))), // <activity android:name=".MainActivity">
-        encodeEnd(22),
+        encodeStart(23, listOf(intArrayOf(11, 1, 24, 0x03, 24))),
+        encodeEnd(23),
         encodeStart(
-          24,
+          25,
           listOf(
-            intArrayOf(10, 1, 25, 0x03, 25),
-            intArrayOf(10, 2, 26, 0x03, 26),
+            intArrayOf(11, 1, 26, 0x03, 26),
+            intArrayOf(11, 2, 27, 0x03, 27),
           ),
-        ), // <provider>
-        encodeEnd(24),
+        ),
+        encodeEnd(25),
         encodeStart(
-          27,
+          28,
           listOf(
-            intArrayOf(10, 1, 28, 0x03, 28),
-            intArrayOf(10, 3, -1, 0x12, -1), // value=true
+            intArrayOf(11, 1, 29, 0x03, 29),
+            intArrayOf(11, 3, -1, 0x12, -1),
           ),
-        ), // <meta-data com.android.vending.splits.required=true>
-        encodeEnd(27),
-        encodeEnd(20),
-        encodeEnd(11),
+        ),
+        encodeEnd(28),
+        encodeEnd(21),
+        encodeEnd(12),
       )
 
     val total = 8 + chunks.sumOf { it.size }

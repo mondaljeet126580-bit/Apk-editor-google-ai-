@@ -17,6 +17,7 @@ data class ParsedManifestInfo(
   val minSdkVersion: Int = 26,
   val targetSdkVersion: Int = 34,
   val isSplitRequired: Boolean = false,
+  val extractNativeLibs: Boolean? = null,
   val permissions: List<String> = emptyList(),
   val activities: List<String> = emptyList(),
   val services: List<String> = emptyList(),
@@ -37,7 +38,8 @@ data class ManifestPatchSpec(
   val minSdkVersion: Int? = null,
   val targetSdkVersion: Int? = null,
   val stripSplitFlags: Boolean = true,
-  val ensureExtractNativeLibsFalse: Boolean = false,
+  val extractNativeLibsOverride: Boolean? = null,
+  val stripUseEmbeddedDex: Boolean = false,
 )
 
 /**
@@ -45,10 +47,12 @@ data class ManifestPatchSpec(
  *
  * Supports both UTF-8 (FLAG_UTF8 = 0x100) and UTF-16LE string pools,
  * preserves all existing string indices, extends RES_XML_RESOURCE_MAP_TYPE
- * cleanly when inserting new framework attributes, handles package cloning
- * (provider authorities, custom permissions, relative component names),
- * disables Split APK requirement flags for standalone installation on Android 13-15,
- * and recalculates all chunk sizes, offsets, 4-byte padding, and root header size accurately.
+ * cleanly when inserting new framework attributes, maintains Android's
+ * required resource-ID sort order inside start-element attribute tables,
+ * handles package cloning (provider authorities, custom permissions,
+ * relative component names), disables Split APK requirement flags,
+ * safely configures android:extractNativeLibs, and recalculates all chunk
+ * sizes, offsets, 4-byte padding, and root header size accurately.
  */
 object AxmlParserAndPatcher {
   private const val RES_STRING_POOL_TYPE = 0x0001
@@ -87,6 +91,7 @@ object AxmlParserAndPatcher {
   const val ATTR_INSTALL_LOCATION = 0x010102b7
   const val ATTR_EXTRACT_NATIVE_LIBS = 0x010104ea
   const val ATTR_IS_SPLIT_REQUIRED = 0x01010591
+  const val ATTR_USE_EMBEDDED_DEX = 0x0101059e
   const val ATTR_REQUIRED_SPLIT_TYPES = 0x0101064e
   const val ATTR_SPLIT_TYPES = 0x0101064f
 
@@ -416,7 +421,35 @@ object AxmlParserAndPatcher {
     )
   }
 
-  private fun encodeStartElement(el: ParsedStartElement): ByteArray {
+  /**
+   * Ensures attributes with framework resource IDs come first in ascending unsigned resource-ID
+   * order (matching AAPT2 & libandroidfw's ResolveAttrs expectation), while updating id/class/style indices.
+   */
+  private fun sortAttributesByResourceId(el: ParsedStartElement, resIds: List<Int>) {
+    if (el.attributes.size <= 1) return
+    val idAttr = if (el.idIndex in 1..el.attributes.size) el.attributes[el.idIndex - 1] else null
+    val classAttr =
+      if (el.classIndex in 1..el.attributes.size) el.attributes[el.classIndex - 1] else null
+    val styleAttr =
+      if (el.styleIndex in 1..el.attributes.size) el.attributes[el.styleIndex - 1] else null
+
+    el.attributes.sortWith(
+      compareBy<AxmlAttribute> { a ->
+        val rId = if (a.name in resIds.indices) resIds[a.name] else 0
+        if (rId != 0) 0 else 1
+      }.thenBy { a ->
+        val rId = if (a.name in resIds.indices) resIds[a.name] else 0
+        rId.toUInt()
+      }
+    )
+
+    el.idIndex = if (idAttr != null) el.attributes.indexOfFirst { it === idAttr } + 1 else 0
+    el.classIndex = if (classAttr != null) el.attributes.indexOfFirst { it === classAttr } + 1 else 0
+    el.styleIndex = if (styleAttr != null) el.attributes.indexOfFirst { it === styleAttr } + 1 else 0
+  }
+
+  private fun encodeStartElement(el: ParsedStartElement, resIds: List<Int>): ByteArray {
+    sortAttributesByResourceId(el, resIds)
     val headerSize = 16
     val extSize = 20
     val attrSize = 20
@@ -482,6 +515,7 @@ object AxmlParserAndPatcher {
     var minSdkVersion = 26
     var targetSdkVersion = 34
     var isSplitRequired = false
+    var extractNativeLibs: Boolean? = null
     val permissions = mutableListOf<String>()
     val activities = mutableListOf<String>()
     val services = mutableListOf<String>()
@@ -541,6 +575,11 @@ object AxmlParserAndPatcher {
                   }
                   attrResId == ATTR_IS_SPLIT_REQUIRED || attrName == "isSplitRequired" -> {
                     if (attr.data != 0) isSplitRequired = true
+                  }
+                  attrResId == ATTR_EXTRACT_NATIVE_LIBS -> {
+                    if (attr.dataType == TYPE_INT_BOOLEAN) {
+                      extractNativeLibs = attr.data != 0
+                    }
                   }
                 }
               }
@@ -607,6 +646,7 @@ object AxmlParserAndPatcher {
       minSdkVersion = minSdkVersion,
       targetSdkVersion = targetSdkVersion,
       isSplitRequired = isSplitRequired,
+      extractNativeLibs = extractNativeLibs,
       permissions = permissions.distinct(),
       activities = activities.distinct(),
       services = services.distinct(),
@@ -617,7 +657,8 @@ object AxmlParserAndPatcher {
 
   /**
    * Patches the binary AndroidManifest.xml according to [patch] and returns a valid
-   * rebuilt AXML byte array with updated string pool, resource map, chunk sizes, and padding.
+   * rebuilt AXML byte array with updated string pool, resource map, sorted attribute tables,
+   * chunk sizes, and 4-byte padding.
    */
   fun patch(axmlBytes: ByteArray, patch: ManifestPatchSpec): ByteArray {
     val chunks = parseChunks(axmlBytes).toMutableList()
@@ -764,9 +805,17 @@ object AxmlParserAndPatcher {
       val intBool = if (boolValue) -1 else 0
       val target = findAttr(el, nsIdx, attrName, targetResId)
       if (target != null) {
-        if (target.dataType == TYPE_INT_BOOLEAN && (target.data != 0) == boolValue) {
+        if (
+          target.dataType == TYPE_INT_BOOLEAN &&
+            (target.data != 0) == boolValue &&
+            attrResId(target) == targetResId
+        ) {
           return false
         }
+        if (attrResId(target) != targetResId) {
+          target.name = ensureAttrNameIndex(attrName, targetResId)
+        }
+        target.ns = nsIdx
         target.rawValue = -1
         target.dataType = TYPE_INT_BOOLEAN
         target.data = intBool
@@ -902,15 +951,20 @@ object AxmlParserAndPatcher {
           if (patch.stripSplitFlags) {
             if (removeAttr(el, "isSplitRequired", ATTR_IS_SPLIT_REQUIRED)) modified = true
           }
-          if (patch.ensureExtractNativeLibsFalse) {
-            val existingExtract = findAttr(el, androidNsIdx, "extractNativeLibs", ATTR_EXTRACT_NATIVE_LIBS)
-            if (existingExtract != null && existingExtract.data == 0) {
-              // Already false (compatible with 16KB-aligned STORED .so files)
-            } else if (existingExtract == null) {
-              // Leaving omitted or false is compatible with 16KB-aligned STORED .so files
-              if (setOrAddBoolAttr(el, androidNsIdx, "extractNativeLibs", ATTR_EXTRACT_NATIVE_LIBS, false)) {
-                modified = true
-              }
+          if (patch.stripUseEmbeddedDex) {
+            if (removeAttr(el, "useEmbeddedDex", ATTR_USE_EMBEDDED_DEX)) modified = true
+          }
+          if (patch.extractNativeLibsOverride != null) {
+            if (
+              setOrAddBoolAttr(
+                el,
+                androidNsIdx,
+                "extractNativeLibs",
+                ATTR_EXTRACT_NATIVE_LIBS,
+                patch.extractNativeLibsOverride,
+              )
+            ) {
+              modified = true
             }
           }
         }
@@ -1025,7 +1079,7 @@ object AxmlParserAndPatcher {
       }
 
       if (modified) {
-        chunk.bytes = encodeStartElement(el)
+        chunk.bytes = encodeStartElement(el, resIds)
       }
     }
 
@@ -1068,7 +1122,7 @@ object AxmlParserAndPatcher {
           patch.targetSdkVersion,
         )
       }
-      val startChunk = RawChunk(RES_XML_START_ELEMENT_TYPE, 16, encodeStartElement(newEl))
+      val startChunk = RawChunk(RES_XML_START_ELEMENT_TYPE, 16, encodeStartElement(newEl, resIds))
       val endChunk = RawChunk(RES_XML_END_ELEMENT_TYPE, 16, encodeEndElement(2, -1, usesSdkTagIdx))
       chunks.add(manifestChunkIdx + 1, startChunk)
       chunks.add(manifestChunkIdx + 2, endChunk)

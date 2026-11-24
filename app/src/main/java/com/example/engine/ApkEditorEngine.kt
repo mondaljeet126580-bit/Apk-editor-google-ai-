@@ -18,11 +18,13 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.FilterOutputStream
+import java.io.InputStream
 import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.zip.CRC32
+import java.util.zip.Deflater
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
@@ -70,14 +72,49 @@ data class SavedProjectItem(
 
 /**
  * Full-featured native Kotlin APK editing, Split APK merging (arm64-v8a / DPI / language splits),
- * resource replacement, strict 4-byte (`resources.arsc`) and 16384-byte (`.so`) ZIP alignment,
- * V1/V2/V3 signing via apksig, and ZArchiver-ready public Download/ApkEditor export engine.
+ * size-optimized repacking (Deflater.BEST_COMPRESSION level 9 for DEX/assets/XML/native .so
+ * when android:extractNativeLibs="true" is verified, with safe 16KB STORED fallback),
+ * strict 4-byte aligned STORED resources.arsc, unused ABI stripping, V1/V2/V3 signing via apksig,
+ * and ZArchiver-ready public Download/ApkEditor export engine.
  */
 object ApkEditorEngine {
   const val OUTPUT_SUBFOLDER = "ApkEditor"
   const val PUBLIC_DISPLAY_DIR = "Download/ApkEditor"
   private const val RESOURCE_ALIGNMENT_BYTES = 4
-  private const val NATIVE_LIB_ALIGNMENT_BYTES = 16384 // 16KB page alignment (satisfies 4KB & 16KB)
+  private const val NATIVE_LIB_ALIGNMENT_BYTES = 16384 // 16KB page alignment fallback
+
+  private val ALREADY_COMPRESSED_MEDIA_EXTENSIONS =
+    setOf(
+      "webp",
+      "jpg",
+      "jpeg",
+      "mp4",
+      "ogg",
+      "mp3",
+      "wav",
+      "m4a",
+      "aac",
+      "flac",
+      "webm",
+      "mkv",
+      "gif",
+      "gz",
+      "zip",
+      "xz",
+      "br",
+      "7z",
+    )
+
+  private val UNUSED_NON_ARM64_ABIS =
+    setOf(
+      "armeabi-v7a",
+      "armeabi",
+      "x86",
+      "x86_64",
+      "mips",
+      "mips64",
+      "riscv64",
+    )
 
   private class CountingOutputStream(out: OutputStream) : FilterOutputStream(out) {
     var bytesWritten: Long = 0L
@@ -167,6 +204,7 @@ object ApkEditorEngine {
       }
       for (splitFile in splitApkFiles) {
         if (!splitFile.exists() || !splitFile.canRead()) continue
+        if (isUnusedAbiSplitFile(splitFile)) continue
         try {
           ZipFile(splitFile).use { splitZip ->
             splitZip.entries().asSequence().forEach { entry ->
@@ -174,7 +212,7 @@ object ApkEditorEngine {
               if (
                 name == "AndroidManifest.xml" ||
                   name == "resources.arsc" ||
-                  isSignatureEntry(name) ||
+                  isExcludedMetadataOrSignature(name) ||
                   name in entriesByPath
               ) {
                 return@forEach
@@ -218,11 +256,12 @@ object ApkEditorEngine {
     }
 
   /**
-   * Merges Split APKs (arm64-v8a libraries + DPI/language/feature resources),
-   * patches AndroidManifest.xml (cloning authorities/permissions & disabling split flags),
-   * replaces launcher icons & custom files, strips old signatures, aligns resources.arsc (4B)
-   * and all `.so` native libraries (16KB / 16384B) as STORED entries, signs with V1+V2+V3
-   * via apksig strictly after alignment, and saves to Download/ApkEditor/.
+   * Merges Split APKs (keeping arm64-v8a libraries + DPI/language/feature resources and dropping
+   * unused CPU architectures), patches AndroidManifest.xml (cloning authorities/permissions,
+   * disabling split flags, and safely setting android:extractNativeLibs="true"), compresses all
+   * compressible entries including DEX/assets/XML and `.so` libraries at Deflater.BEST_COMPRESSION
+   * (level 9), keeps resources.arsc STORED + 4-byte aligned, signs with V1+V2+V3 via apksig
+   * strictly after repacking, and saves to Download/ApkEditor/.
    */
   suspend fun buildSignAndExportApk(
     context: Context,
@@ -238,11 +277,17 @@ object ApkEditorEngine {
       val signedTempApk = File(workDir, "signed_${System.currentTimeMillis()}.apk")
 
       try {
-        val validSplits = splitApkFiles.filter { it.exists() && it.canRead() && it.absolutePath != sourceApkFile.absolutePath }
+        val validSplits =
+          splitApkFiles.filter {
+            it.exists() &&
+              it.canRead() &&
+              it.absolutePath != sourceApkFile.absolutePath &&
+              !isUnusedAbiSplitFile(it)
+          }
         if (validSplits.isNotEmpty()) {
-          onProgress("Merging base APK with ${validSplits.size} split APK(s) & arm64-v8a libraries...")
+          onProgress("Merging base APK with ${validSplits.size} arm64/resource split(s)...")
         } else {
-          onProgress("Patching AndroidManifest.xml & aligning resources...")
+          onProgress("Patching AndroidManifest.xml & optimizing compression...")
         }
 
         repackAndAlignApk(
@@ -253,7 +298,7 @@ object ApkEditorEngine {
           onProgress = onProgress,
         )
 
-        onProgress("Signing aligned APK (V1 + V2 + V3 via apksig)...")
+        onProgress("Signing optimized APK (V1 + V2 + V3 via apksig)...")
         ApkSignerHelper.signApk(
           context = context,
           inputUnsignedApk = unsignedAlignedApk,
@@ -317,104 +362,146 @@ object ApkEditorEngine {
       }
     }
 
-    // Detect if any native .so libraries exist across base + split APKs
+    // Filter out split APKs that exclusively target unused non-arm64 CPU architectures
+    val keptSplits =
+      splitApkFiles.filter {
+        it.exists() && it.canRead() && it.absolutePath != sourceApkFile.absolutePath && !isUnusedAbiSplitFile(it)
+      }
+
+    // Pre-scan base + splits to detect native libraries, arm64-v8a availability, and DEX indices
     var hasNativeLibs = false
+    var hasArm64Libs = false
     val existingDexIndices = HashSet<Int>()
 
     ZipFile(sourceApkFile).use { baseZip ->
       val baseEntries = baseZip.entries().toList()
       for (e in baseEntries) {
-        if (e.name.endsWith(".so", ignoreCase = true)) hasNativeLibs = true
-        parseDexIndex(e.name)?.let { existingDexIndices.add(it) }
+        val name = e.name
+        if (name.endsWith(".so", ignoreCase = true)) {
+          hasNativeLibs = true
+          if (name.startsWith("lib/arm64-v8a/", ignoreCase = true)) hasArm64Libs = true
+        }
+        parseDexIndex(name)?.let { existingDexIndices.add(it) }
       }
-      if (!hasNativeLibs) {
-        for (sf in splitApkFiles) {
-          try {
-            ZipFile(sf).use { sz ->
-              if (sz.entries().asSequence().any { it.name.endsWith(".so", ignoreCase = true) }) {
+      for (sf in keptSplits) {
+        try {
+          ZipFile(sf).use { sz ->
+            for (e in sz.entries().asSequence()) {
+              val name = e.name
+              if (name.endsWith(".so", ignoreCase = true)) {
                 hasNativeLibs = true
+                if (name.startsWith("lib/arm64-v8a/", ignoreCase = true)) hasArm64Libs = true
               }
             }
-          } catch (_: Exception) {
           }
+        } catch (_: Exception) {
         }
       }
 
-      // Always strip split flags when merging splits or when any manifest patch is requested
-      val effectiveManifestPatch: ManifestPatchSpec? =
-        when {
-          request.manifestPatch != null ->
-            request.manifestPatch.copy(
-              stripSplitFlags = true,
-              ensureExtractNativeLibsFalse = hasNativeLibs,
-            )
-          splitApkFiles.isNotEmpty() ->
-            ManifestPatchSpec(
-              stripSplitFlags = true,
-              ensureExtractNativeLibsFalse = hasNativeLibs,
-            )
-          else -> null
+      // Prepare & verify patched AndroidManifest.xml BEFORE writing entries so we know with 100%
+      // certainty whether android:extractNativeLibs="true" is safely applied (enabling Level 9 .so compression)
+      val manifestEntry = baseZip.getEntry("AndroidManifest.xml")
+      val rawOriginalManifest =
+        request.fileReplacements["AndroidManifest.xml"]
+          ?: manifestEntry?.let { baseZip.getInputStream(it).use { s -> s.readBytes() } }
+
+      var finalManifestBytes: ByteArray? = rawOriginalManifest
+      var canCompressNativeLibs = false
+
+      if (rawOriginalManifest != null) {
+        val baseSpec =
+          (request.manifestPatch ?: ManifestPatchSpec()).copy(
+            stripSplitFlags = true,
+            stripUseEmbeddedDex = true,
+          )
+        if (hasNativeLibs) {
+          // Attempt to safely set android:extractNativeLibs="true" and verify roundtrip integrity
+          val candidateResult =
+            runCatching {
+              val origParsed = AxmlParserAndPatcher.parseManifestInfo(rawOriginalManifest)
+              val patched =
+                AxmlParserAndPatcher.patch(
+                  rawOriginalManifest,
+                  baseSpec.copy(extractNativeLibsOverride = true),
+                )
+              val reparsed = AxmlParserAndPatcher.parseManifestInfo(patched)
+              val expectedPkg = baseSpec.packageName?.trim()?.ifBlank { null } ?: origParsed.packageName
+              val intact =
+                reparsed.extractNativeLibs == true &&
+                  (expectedPkg.isBlank() || reparsed.packageName == expectedPkg)
+              if (intact) patched else null
+            }.getOrNull()
+
+          if (candidateResult != null) {
+            finalManifestBytes = candidateResult
+            canCompressNativeLibs = true
+          } else {
+            // Safe fallback: keep .so STORED with 16KB alignment and apply user's manifest edits only
+            canCompressNativeLibs = false
+            finalManifestBytes =
+              if (request.manifestPatch != null || keptSplits.isNotEmpty()) {
+                AxmlParserAndPatcher.patch(
+                  rawOriginalManifest,
+                  baseSpec.copy(extractNativeLibsOverride = null),
+                )
+              } else {
+                rawOriginalManifest
+              }
+          }
+        } else if (request.manifestPatch != null || keptSplits.isNotEmpty()) {
+          finalManifestBytes = AxmlParserAndPatcher.patch(rawOriginalManifest, baseSpec)
         }
+      }
 
       val countingStream =
         CountingOutputStream(BufferedOutputStream(FileOutputStream(outputUnsignedApk), 64 * 1024))
       ZipOutputStream(countingStream).use { zos ->
-        zos.setLevel(6)
+        zos.setLevel(Deflater.BEST_COMPRESSION)
         val writtenPaths = HashSet<String>()
 
-        // 1. Write all entries from base.apk (stripping old signatures & applying patches/replacements)
+        // 1. Write all entries from base.apk
         for ((index, entry) in baseEntries.withIndex()) {
           val path = entry.name
           if (index % 40 == 0) {
-            onProgress("Repacking base APK (${index + 1}/${baseEntries.size})...")
+            onProgress("Optimizing base APK (${index + 1}/${baseEntries.size})...")
           }
 
-          if (isSignatureEntry(path)) continue
+          if (isExcludedMetadataOrSignature(path)) continue
           if (path in request.deletedEntries) continue
+          if (shouldSkipUnusedAbiEntry(path, hasArm64Libs)) continue
 
-          if (entry.isDirectory) {
-            if (writtenPaths.add(path)) {
-              zos.putNextEntry(ZipEntry(path).apply { time = 0L })
-              zos.closeEntry()
-            }
-            continue
-          }
+          if (entry.isDirectory) continue
 
           val replacedBytes: ByteArray? =
             when {
+              path == "AndroidManifest.xml" -> finalManifestBytes
               path in request.fileReplacements -> request.fileReplacements[path]
-              path == "AndroidManifest.xml" && effectiveManifestPatch != null -> {
-                val origManifest = baseZip.getInputStream(entry).use { it.readBytes() }
-                AxmlParserAndPatcher.patch(origManifest, effectiveManifestPatch)
-              }
               request.newLauncherIcon != null && isLauncherIconRasterEntry(path) -> {
                 encodeScaledIconPng(targetIconSizeForPath(path))
               }
               else -> null
             }
 
-          writtenPaths.add(path)
-          writeZipEntryAligned(
+          if (!writtenPaths.add(path)) continue
+          writeOptimizedZipEntry(
             zos = zos,
             countingStream = countingStream,
             path = path,
             originalEntry = entry,
             overrideBytes = replacedBytes,
-            readOriginalBytes = { baseZip.getInputStream(entry).use { it.readBytes() } },
-            streamOriginalToZos = { baseZip.getInputStream(entry).use { input -> input.copyTo(zos, 32 * 1024) } },
+            canCompressNativeLibs = canCompressNativeLibs,
+            openOriginalStream = { baseZip.getInputStream(entry) },
           )
         }
 
-        // 2. Merge all split APKs (arm64-v8a / ABI native libs, DPI & language resources, assets, feature dexes)
-        // Prioritize ABI splits first (so arm64-v8a native libs are guaranteed to be included)
+        // 2. Merge kept split APKs (arm64-v8a native libs, DPI & language resources, assets, feature dexes)
         val orderedSplits =
-          splitApkFiles.sortedBy { file ->
+          keptSplits.sortedBy { file ->
             val n = file.name.lowercase(Locale.ROOT)
             when {
               n.contains("arm64") -> 0
-              n.contains("armeabi") || n.contains("x86") -> 1
-              n.contains("dpi") -> 2
-              else -> 3
+              n.contains("dpi") -> 1
+              else -> 2
             }
           }
 
@@ -424,11 +511,11 @@ object ApkEditorEngine {
             val splitEntries = splitZip.entries().toList()
             for (entry in splitEntries) {
               val rawPath = entry.name
-              if (isSignatureEntry(rawPath)) continue
+              if (isExcludedMetadataOrSignature(rawPath)) continue
               if (rawPath == "AndroidManifest.xml" || rawPath == "resources.arsc") continue
               if (entry.isDirectory) continue
+              if (shouldSkipUnusedAbiEntry(rawPath, hasArm64Libs)) continue
 
-              // Assign next free classesN.dex name if a feature split ships its own DEX
               val targetPath =
                 if (rawPath.matches(Regex("^classes\\d*\\.dex$")) && rawPath in writtenPaths) {
                   val nextIdx = allocateNextDexIndex(existingDexIndices)
@@ -438,7 +525,7 @@ object ApkEditorEngine {
                 }
 
               if (targetPath in request.deletedEntries) continue
-              if (targetPath in writtenPaths) continue
+              if (!writtenPaths.add(targetPath)) continue
 
               parseDexIndex(targetPath)?.let { existingDexIndices.add(it) }
 
@@ -451,15 +538,14 @@ object ApkEditorEngine {
                   else -> null
                 }
 
-              writtenPaths.add(targetPath)
-              writeZipEntryAligned(
+              writeOptimizedZipEntry(
                 zos = zos,
                 countingStream = countingStream,
                 path = targetPath,
                 originalEntry = entry,
                 overrideBytes = replacedBytes,
-                readOriginalBytes = { splitZip.getInputStream(entry).use { it.readBytes() } },
-                streamOriginalToZos = { splitZip.getInputStream(entry).use { input -> input.copyTo(zos, 32 * 1024) } },
+                canCompressNativeLibs = canCompressNativeLibs,
+                openOriginalStream = { splitZip.getInputStream(entry) },
               )
             }
           }
@@ -467,13 +553,19 @@ object ApkEditorEngine {
 
         // 3. Write any brand-new replacement files not originally present in base or splits
         for ((newPath, newBytes) in request.fileReplacements) {
-          if (newPath !in writtenPaths && newPath !in request.deletedEntries && !isSignatureEntry(newPath)) {
+          if (
+            newPath !in writtenPaths &&
+              newPath !in request.deletedEntries &&
+              !isExcludedMetadataOrSignature(newPath) &&
+              !shouldSkipUnusedAbiEntry(newPath, hasArm64Libs)
+          ) {
             writtenPaths.add(newPath)
             val isResourcesArsc = newPath == "resources.arsc"
             val isNativeSo = newPath.endsWith(".so", ignoreCase = true)
-            if (isResourcesArsc || isNativeSo) {
+            val isMedia = isAlreadyCompressedMedia(newPath)
+            if (isResourcesArsc || isMedia || (isNativeSo && !canCompressNativeLibs)) {
               val alignment = if (isNativeSo) NATIVE_LIB_ALIGNMENT_BYTES else RESOURCE_ALIGNMENT_BYTES
-              writeAlignedStoredEntry(zos, countingStream, newPath, newBytes, alignment)
+              writeAlignedStoredBytes(zos, countingStream, newPath, newBytes, alignment)
             } else {
               val outEntry =
                 ZipEntry(newPath).apply {
@@ -490,23 +582,44 @@ object ApkEditorEngine {
     }
   }
 
-  private fun writeZipEntryAligned(
+  private fun writeOptimizedZipEntry(
     zos: ZipOutputStream,
     countingStream: CountingOutputStream,
     path: String,
     originalEntry: ZipEntry,
     overrideBytes: ByteArray?,
-    readOriginalBytes: () -> ByteArray,
-    streamOriginalToZos: () -> Unit,
+    canCompressNativeLibs: Boolean,
+    openOriginalStream: () -> InputStream,
   ) {
     val isResourcesArsc = path == "resources.arsc"
     val isNativeSo = path.endsWith(".so", ignoreCase = true)
-    val mustStoreAligned = isResourcesArsc || isNativeSo || originalEntry.method == ZipEntry.STORED
+    val isMedia = isAlreadyCompressedMedia(path)
+    val isAlreadyCompressedPng =
+      path.endsWith(".png", ignoreCase = true) && originalEntry.method == ZipEntry.STORED
 
-    if (mustStoreAligned) {
-      val dataBytes = overrideBytes ?: readOriginalBytes()
+    val shouldStoreUncompressed =
+      when {
+        isResourcesArsc -> true
+        isNativeSo -> !canCompressNativeLibs
+        isMedia -> true
+        isAlreadyCompressedPng -> true
+        else -> false
+      }
+
+    if (shouldStoreUncompressed) {
       val alignment = if (isNativeSo) NATIVE_LIB_ALIGNMENT_BYTES else RESOURCE_ALIGNMENT_BYTES
-      writeAlignedStoredEntry(zos, countingStream, path, dataBytes, alignment)
+      if (overrideBytes != null) {
+        writeAlignedStoredBytes(zos, countingStream, path, overrideBytes, alignment)
+      } else {
+        writeAlignedStoredStream(
+          zos = zos,
+          countingStream = countingStream,
+          entryName = path,
+          originalEntry = originalEntry,
+          alignment = alignment,
+          openStream = openOriginalStream,
+        )
+      }
     } else {
       val outEntry =
         ZipEntry(path).apply {
@@ -517,17 +630,85 @@ object ApkEditorEngine {
       if (overrideBytes != null) {
         zos.write(overrideBytes)
       } else {
-        streamOriginalToZos()
+        openOriginalStream().use { input -> input.copyTo(zos, 64 * 1024) }
       }
       zos.closeEntry()
     }
   }
 
-  private fun writeAlignedStoredEntry(
+  private fun writeAlignedStoredBytes(
     zos: ZipOutputStream,
     countingStream: CountingOutputStream,
     entryName: String,
     data: ByteArray,
+    alignment: Int,
+  ) {
+    val crc = CRC32().apply { update(data) }.value
+    putAlignedStoredEntryHeader(
+      zos = zos,
+      countingStream = countingStream,
+      entryName = entryName,
+      size = data.size.toLong(),
+      crc = crc,
+      alignment = alignment,
+    )
+    zos.write(data)
+    zos.closeEntry()
+    zos.flush()
+  }
+
+  /**
+   * Streams large STORED entries (such as resources.arsc, media files, or fallback .so libraries)
+   * without buffering the entire payload in heap memory.
+   */
+  private fun writeAlignedStoredStream(
+    zos: ZipOutputStream,
+    countingStream: CountingOutputStream,
+    entryName: String,
+    originalEntry: ZipEntry,
+    alignment: Int,
+    openStream: () -> InputStream,
+  ) {
+    val size: Long
+    val crc: Long
+    if (originalEntry.size >= 0L && originalEntry.crc >= 0L) {
+      size = originalEntry.size
+      crc = originalEntry.crc
+    } else {
+      val crcCalc = CRC32()
+      var total = 0L
+      val buf = ByteArray(64 * 1024)
+      openStream().use { input ->
+        while (true) {
+          val read = input.read(buf)
+          if (read <= 0) break
+          crcCalc.update(buf, 0, read)
+          total += read.toLong()
+        }
+      }
+      size = total
+      crc = crcCalc.value
+    }
+
+    putAlignedStoredEntryHeader(
+      zos = zos,
+      countingStream = countingStream,
+      entryName = entryName,
+      size = size,
+      crc = crc,
+      alignment = alignment,
+    )
+    openStream().use { input -> input.copyTo(zos, 64 * 1024) }
+    zos.closeEntry()
+    zos.flush()
+  }
+
+  private fun putAlignedStoredEntryHeader(
+    zos: ZipOutputStream,
+    countingStream: CountingOutputStream,
+    entryName: String,
+    size: Long,
+    crc: Long,
     alignment: Int,
   ) {
     zos.flush()
@@ -538,23 +719,49 @@ object ApkEditorEngine {
     val remainder = (headerBase % alignment).toInt()
     val paddingLen = if (remainder == 0) 0 else (alignment - remainder)
 
-    val crc = CRC32().apply { update(data) }.value
     val storedEntry =
       ZipEntry(entryName).apply {
         method = ZipEntry.STORED
         time = 0L
-        size = data.size.toLong()
-        compressedSize = data.size.toLong()
+        this.size = size
+        this.compressedSize = size
         this.crc = crc
         if (paddingLen > 0) {
           extra = ByteArray(paddingLen)
         }
       }
-
     zos.putNextEntry(storedEntry)
-    zos.write(data)
-    zos.closeEntry()
-    zos.flush()
+  }
+
+  internal fun isAlreadyCompressedMedia(path: String): Boolean {
+    val dotIdx = path.lastIndexOf('.')
+    if (dotIdx < 0 || dotIdx == path.lastIndex) return false
+    val ext = path.substring(dotIdx + 1).lowercase(Locale.ROOT)
+    return ext in ALREADY_COMPRESSED_MEDIA_EXTENSIONS
+  }
+
+  internal fun isUnusedAbiSplitFile(file: File): Boolean {
+    val name = file.name.lowercase(Locale.ROOT)
+    if (name.contains("arm64")) return false
+    return name.contains("armeabi") ||
+      name.contains("x86_64") ||
+      name.contains("x86") ||
+      name.contains("mips") ||
+      name.contains("riscv")
+  }
+
+  internal fun shouldSkipUnusedAbiEntry(path: String, hasArm64Libs: Boolean): Boolean {
+    if (!path.startsWith("lib/", ignoreCase = true)) return false
+    val rest = path.substring(4)
+    val slashIdx = rest.indexOf('/')
+    if (slashIdx <= 0) return false
+    val abi = rest.substring(0, slashIdx).lowercase(Locale.ROOT)
+    if (abi == "arm64-v8a") return false
+    // Always drop non-ARM architectures (x86, x86_64, mips, riscv)
+    if (abi in UNUSED_NON_ARM64_ABIS && abi != "armeabi-v7a" && abi != "armeabi") return true
+    // Drop 32-bit ARM when arm64-v8a native libraries exist (all modern apps on Vivo T2x 5G)
+    if (hasArm64Libs && (abi == "armeabi-v7a" || abi == "armeabi")) return true
+    return false
   }
 
   private fun parseDexIndex(path: String): Int? {
@@ -570,8 +777,9 @@ object ApkEditorEngine {
     return idx
   }
 
-  internal fun isSignatureEntry(path: String): Boolean {
+  internal fun isExcludedMetadataOrSignature(path: String): Boolean {
     if (path.equals("stamp-cert-sha256", ignoreCase = true)) return true
+    if (path.startsWith("META-INF/com/android/build/", ignoreCase = true)) return true
     if (!path.startsWith("META-INF/", ignoreCase = true)) return false
     val fileName = path.substringAfterLast('/')
     if (fileName.equals("MANIFEST.MF", ignoreCase = true)) return true
